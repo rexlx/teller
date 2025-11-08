@@ -1,15 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
-	"sync"
+	"os"
 	"time"
 
 	"github.com/hpcloud/tail"
@@ -17,195 +15,139 @@ import (
 )
 
 var (
-	syslogMode = flag.Bool("syslog", false, "Enable syslog logging")
 	filePath   = flag.String("file", "log.txt", "File to tail")
+	serverAddr = flag.String("server", "neo.nullferatu.com:5140", "QUIC server address")
 )
 
-type Logger interface {
-	Process() ([]byte, error)
-}
-
 type SyslogLine struct {
-	Beat      bool   `json:"beat"`
 	Timestamp string `json:"timestamp"`
 	Hostname  string `json:"hostname"`
 	Program   string `json:"program"`
-	Pid       string `json:"pid"`
+	Pid       int    `json:"pid"`
 	Message   string `json:"message"`
-}
-
-func (l *SyslogLine) Process() ([]byte, error) {
-	return json.Marshal(l)
 }
 
 type App struct {
 	Conn      quic.Connection
-	ReqCh     chan SyslogLine
-	Requsts   []SyslogLine
-	Client    *http.Client
 	InputFile string
-	Memory    *sync.Mutex // Changed to sync.Mutex
-	Lines     bytes.Buffer
+	Hostname  string
+	Pid       int
 }
 
 func (a *App) TailAndProcess() {
+	// Config: Poll:true is useful for mounted filesystems, but can be high CPU.
+	// Adjusted to standard tailing from end of file.
 	t, err := tail.TailFile(a.InputFile, tail.Config{
-		Follow: true,
-		ReOpen: true,
-		Poll:   true,
+		Follow:   true,
+		ReOpen:   true,
+		Poll:     true,
+		Location: &tail.SeekInfo{Offset: 0, Whence: 2},
+		Logger:   tail.DiscardingLogger,
 	})
 	if err != nil {
-		fmt.Printf("Error tailing file: %v\n", err)
-		return
+		log.Fatalf("Error starting tail on %s: %v", a.InputFile, err)
 	}
 
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// Open one stream for sending logs
 	stream, err := a.Conn.OpenStreamSync(context.Background())
 	if err != nil {
-		fmt.Printf("Error opening stream: %v\n", err)
+		log.Printf("Error opening QUIC stream: %v", err)
 		return
 	}
 	defer stream.Close()
-	// go func() {
+
+	log.Println("Stream opened, sending logs...")
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case line, ok := <-t.Lines:
 			if !ok {
-				fmt.Println("Tail stopped")
+				log.Println("Tail channel closed, exiting.")
 				return
 			}
-			// fmt.Println("New line:", line.Text, len(line.Text))
-			a.Memory.Lock()
-			_, err := a.Lines.WriteString(line.Text + "\n")
-			if err != nil {
-				fmt.Printf("Error writing to buffer: %v\n", err)
-				a.Memory.Unlock()
+			if line.Err != nil {
+				log.Printf("Tail error: %v", line.Err)
 				continue
 			}
-			a.Memory.Unlock()
 
+			// Prepare the log line
 			sl := SyslogLine{
-				Timestamp: time.Now().String(),
-				Hostname:  "localhost",
-				Program:   "myapp",
-				Pid:       "1234",
+				Timestamp: time.Now().Format(time.RFC3339),
+				Hostname:  a.Hostname,
+				Program:   "teller",
+				Pid:       a.Pid,
 				Message:   line.Text,
 			}
+
 			data, err := json.Marshal(sl)
 			if err != nil {
-				fmt.Printf("Error marshalling syslog line: %v\n", err)
+				log.Printf("Error marshalling JSON: %v", err)
 				continue
 			}
+
+			// Write to QUIC stream
+			// Note: Your server implementation expects the whole JSON in one Read().
+			// If logs are huge, this might fragment and break the server parser.
 			_, err = stream.Write(data)
 			if err != nil {
-				a.AddRequest(sl)
-				fmt.Printf("Error writing to stream: %v\n", err)
+				log.Printf("Error writing to stream (server might be down): %v", err)
+				// In a robust app, you might try to reconnect here.
 				return
 			}
-			chunk := make([]byte, 4096)
-			n, err := stream.Read(chunk)
-			if err != nil {
-				fmt.Printf("Error reading from stream: %v\n", err)
-				return
-			}
-			if n < 1 {
-				// fmt.Printf("Received: %s\n", string(chunk[:n]))
-				fmt.Print(" got one ")
-			}
+
 		case <-ticker.C:
-			// fmt.Println("Sending heartbeat...")
-			data, err := json.Marshal(SyslogLine{
-				Beat:      true,
-				Timestamp: time.Now().String(),
-			})
+			// Send the specific string your server looks for to ignore beats
+			_, err := stream.Write([]byte("|beat|"))
 			if err != nil {
-				fmt.Printf("Error marshalling beat data: %v\n", err)
-				continue
-			}
-			_, err = stream.Write(data)
-			if err != nil {
-				fmt.Printf("Error writing to stream: %v\n", err)
+				log.Printf("Heartbeat failed: %v", err)
 				return
-			}
-			chunk := make([]byte, 4096)
-			n, err := stream.Read(chunk)
-			if err != nil {
-				fmt.Printf("Error reading from stream: %v\n", err)
-				return
-			}
-			if n < 1 {
-				// fmt.Printf("Received: %s\n", string(chunk[:n]))
-				fmt.Print(" got one ")
 			}
 		}
 	}
-	// }()
-	// for {
-	// 	chunk := make([]byte, 4096)
-	// 	n, err := stream.Read(chunk)
-	// 	if err != nil {
-	// 		fmt.Printf("Error reading from stream: %v\n", err)
-	// 		return
-	// 	}
-	// 	if n > 0 {
-	// 		// fmt.Printf("Received: %s\n", string(chunk[:n]))
-	// 		fmt.Print(" got one ")
-	// 	}
-	// }
 }
 
-func (a *App) AddRequest(req SyslogLine) {
-	// limit := 150
-	a.Memory.Lock()
-	defer a.Memory.Unlock()
-	// if len(a.Requsts) >= limit {
-	// 	a.Requsts = a.Requsts[1:]
-	// }
-	a.Requsts = append(a.Requsts, req)
-}
-
-func (a *App) ProcessRequests() {
-	fmt.Println("Processing requests...")
-	// wg := sync.WaitGroup{}
-	stream, err := a.Conn.OpenStreamSync(context.Background())
-	if err != nil {
-		fmt.Printf("Error opening stream: %v\n", err)
-		return
-	}
-	defer stream.Close()
-	a.Memory.Lock()
-	defer a.Memory.Unlock()
-}
-
-func main() {
-	flag.Parse()
-
-	app := &App{
-		ReqCh:     make(chan SyslogLine, 500),
-		Requsts:   make([]SyslogLine, 500),
-		Client:    &http.Client{},
-		InputFile: *filePath,
-		Memory:    &sync.Mutex{}, // Initialize sync.Mutex
-	}
-	if err := app.InitQUICConnection(); err != nil {
-		log.Fatalf("Failed to initialize QUIC connection: %v", err)
-	}
-
-	fmt.Printf("Tailing file: %s (syslog mode: %v)\n", app.InputFile, *syslogMode)
-	app.TailAndProcess()
-}
-
-func (a *App) InitQUICConnection() error {
+func (a *App) InitQUICConnection(addr string) error {
 	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // ONLY for testing
-		NextProtos:         []string{"quic-log-protocol"},
+		InsecureSkipVerify: true, // Kept for your testing environment
+		NextProtos:         []string{"rider-protocol"},
 	}
 
-	conn, err := quic.DialAddr(context.Background(), "mrbyte:8081", tlsConf, nil)
+	// Using KeepAlive so the connection doesn't die silently
+	quicConf := &quic.Config{
+		KeepAlivePeriod: 10 * time.Second,
+		MaxIdleTimeout:  1 * time.Minute,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConf)
 	if err != nil {
 		return fmt.Errorf("error dialing QUIC: %v", err)
 	}
 	a.Conn = conn
 	return nil
+}
+
+func main() {
+	flag.Parse()
+
+	hostname, _ := os.Hostname()
+	app := &App{
+		InputFile: *filePath,
+		Hostname:  hostname,
+		Pid:       os.Getpid(),
+	}
+
+	log.Printf("Connecting to QUIC server at %s...", *serverAddr)
+	if err := app.InitQUICConnection(*serverAddr); err != nil {
+		log.Fatalf("Failed to initialize QUIC connection: %v", err)
+	}
+	defer app.Conn.CloseWithError(0, "client exiting")
+
+	log.Printf("Tailing file: %s", app.InputFile)
+	app.TailAndProcess()
 }
