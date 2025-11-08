@@ -87,6 +87,7 @@ func (a *App) TailAndProcess() {
 				log.Printf("Error marshalling JSON: %v", err)
 				continue
 			}
+			data = append(data, '\n') // Append newline for server parsing
 
 			// Write to QUIC stream
 			// Note: Your server implementation expects the whole JSON in one Read().
