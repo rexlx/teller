@@ -112,13 +112,13 @@ func (a *App) TailAndProcess() {
 			}
 
 		case <-ticker.C:
-			fmt.Println("Sending heartbeat...")
+			// fmt.Println("Sending heartbeat...")
 			// Send the specific string your server looks for to ignore beats
-			// _, err := stream.Write([]byte("|beat|\n"))
-			// if err != nil {
-			// 	log.Printf("Heartbeat failed: %v", err)
-			// 	return
-			// }
+			_, err := stream.Write([]byte("|beat|\n"))
+			if err != nil {
+				log.Printf("Heartbeat failed: %v", err)
+				return
+			}
 		}
 	}
 }
