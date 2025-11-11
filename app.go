@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/hpcloud/tail"
@@ -64,6 +65,7 @@ func (a *App) TailAndProcess() {
 	for {
 		select {
 		case line, ok := <-t.Lines:
+			var data []byte
 			if !ok {
 				log.Println("Tail channel closed, exiting.")
 				return
@@ -72,7 +74,17 @@ func (a *App) TailAndProcess() {
 				log.Printf("Tail error: %v", line.Err)
 				continue
 			}
-
+			trimmedLine := strings.TrimSpace(line.Text)
+			if len(trimmedLine) > 0 && trimmedLine[0] == '{' {
+				data = []byte(trimmedLine + "\n")
+				// Write raw JSON line to QUIC stream
+				_, err = stream.Write(data)
+				if err != nil {
+					log.Printf("Error writing JSON line to stream: %v", err)
+					return
+				}
+				continue
+			}
 			// Prepare the log line
 			sl := SyslogLine{
 				Timestamp: time.Now().Format(time.RFC3339),
@@ -100,12 +112,13 @@ func (a *App) TailAndProcess() {
 			}
 
 		case <-ticker.C:
+			fmt.Println("Sending heartbeat...")
 			// Send the specific string your server looks for to ignore beats
-			_, err := stream.Write([]byte("|beat|"))
-			if err != nil {
-				log.Printf("Heartbeat failed: %v", err)
-				return
-			}
+			// _, err := stream.Write([]byte("|beat|\n"))
+			// if err != nil {
+			// 	log.Printf("Heartbeat failed: %v", err)
+			// 	return
+			// }
 		}
 	}
 }
